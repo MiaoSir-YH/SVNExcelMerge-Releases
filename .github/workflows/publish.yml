@@ -1,0 +1,71 @@
+name: Publish signed release
+
+on:
+  push:
+    branches: ["publish/**"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-signed-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate and publish assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          incoming=(.incoming/*)
+          if [[ ${#incoming[@]} -ne 1 ]]; then
+            echo "Expected one incoming release directory" >&2
+            exit 1
+          fi
+          directory="${incoming[0]}"
+          metadata="$directory/metadata.json"
+          notes="$directory/notes.md"
+          assets_dir="$directory/assets"
+          tag="$(jq -er '.tag | select(test("^(merge|history)-v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"))' "$metadata")"
+          version="$(jq -er '.version' "$metadata")"
+          title="$(jq -er '.title' "$metadata")"
+          repository="$(jq -er '.repository' "$metadata")"
+          [[ "$repository" == "$GITHUB_REPOSITORY" ]]
+          [[ "$GITHUB_REF_NAME" == "publish/$tag-"* ]]
+          [[ -f "$notes" ]]
+
+          mapfile -t expected_assets < <(jq -er '.assets[]' "$metadata" | sort)
+          mapfile -t actual_assets < <(find "$assets_dir" -maxdepth 1 -type f -printf '%f\n' | sort)
+          [[ "${expected_assets[*]}" == "${actual_assets[*]}" ]]
+          for name in "${expected_assets[@]}"; do
+            [[ "$name" == "$(basename "$name")" ]]
+            [[ -s "$assets_dir/$name" ]]
+          done
+
+          installer="$(printf '%s\n' "${expected_assets[@]}" | grep -E '_x64-setup\.exe$')"
+          expected_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/$installer"
+          jq -e --arg version "$version" --arg url "$expected_url" '
+            .version == $version
+            and .platforms["windows-x86_64"].url == $url
+            and (.platforms["windows-x86_64"].signature | length) > 20
+          ' "$assets_dir/latest.json" >/dev/null
+
+          asset_paths=()
+          for name in "${expected_assets[@]}"; do asset_paths+=("$assets_dir/$name"); done
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "${asset_paths[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$tag" --title "$title" --notes-file "$notes" --latest --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" "${asset_paths[@]}" --title "$title" --notes-file "$notes" --target main --latest --repo "$GITHUB_REPOSITORY"
+          fi
+      - name: Remove temporary publishing branch
+        if: success()
+        shell: bash
+        run: git push origin --delete "$GITHUB_REF_NAME"
