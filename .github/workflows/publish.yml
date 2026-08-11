@@ -17,6 +17,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Install signature verifier
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes minisign
       - name: Validate and publish assets
         shell: bash
         env:
@@ -33,29 +37,52 @@ jobs:
           metadata="$directory/metadata.json"
           notes="$directory/notes.md"
           assets_dir="$directory/assets"
-          tag="$(jq -er '.tag | select(test("^(merge|history)-v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"))' "$metadata")"
-          version="$(jq -er '.version' "$metadata")"
+          app="$(jq -er '.app | select(. == "merge" or . == "history")' "$metadata")"
+          version="$(jq -er '.version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"))' "$metadata")"
+          tag="$(jq -er '.tag' "$metadata")"
           title="$(jq -er '.title' "$metadata")"
           repository="$(jq -er '.repository' "$metadata")"
           [[ "$repository" == "$GITHUB_REPOSITORY" ]]
+          case "$GITHUB_REPOSITORY" in
+            MiaoSir-YH/SVNExcelMerge-Releases)
+              [[ "$app" == "merge" ]]
+              expected_tag="merge-v$version"
+              installer="Excel-Semantic-Merge_${version}_x64-setup.exe"
+              ;;
+            MiaoSir-YH/SVNExcelHistory-Releases)
+              [[ "$app" == "history" ]]
+              expected_tag="history-v$version"
+              installer="SVN-Excel-History_${version}_x64-setup.exe"
+              ;;
+            *) exit 1 ;;
+          esac
+          [[ "$tag" == "$expected_tag" ]]
           [[ "$GITHUB_REF_NAME" == "publish/$tag-"* ]]
           [[ -f "$notes" ]]
+          [[ -f updater.pub ]]
 
-          mapfile -t expected_assets < <(jq -er '.assets[]' "$metadata" | sort)
+          mapfile -t declared_assets < <(jq -er '.assets[]' "$metadata" | sort)
           mapfile -t actual_assets < <(find "$assets_dir" -maxdepth 1 -type f -printf '%f\n' | sort)
+          expected_assets=("$installer" "$installer.sig" "latest.json")
+          mapfile -t expected_assets < <(printf '%s\n' "${expected_assets[@]}" | sort)
+          [[ "${declared_assets[*]}" == "${expected_assets[*]}" ]]
           [[ "${expected_assets[*]}" == "${actual_assets[*]}" ]]
           for name in "${expected_assets[@]}"; do
             [[ "$name" == "$(basename "$name")" ]]
             [[ -s "$assets_dir/$name" ]]
           done
 
-          installer="$(printf '%s\n' "${expected_assets[@]}" | grep -E '_x64-setup\.exe$')"
           expected_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/$installer"
           jq -e --arg version "$version" --arg url "$expected_url" '
             .version == $version
             and .platforms["windows-x86_64"].url == $url
             and (.platforms["windows-x86_64"].signature | length) > 20
           ' "$assets_dir/latest.json" >/dev/null
+          manifest_signature="$(jq -er '.platforms["windows-x86_64"].signature' "$assets_dir/latest.json")"
+          detached_signature="$(tr -d '\r\n' < "$assets_dir/$installer.sig")"
+          [[ "$manifest_signature" == "$detached_signature" ]]
+          base64 --decode "$assets_dir/$installer.sig" > "$RUNNER_TEMP/updater.minisig"
+          minisign -Vm "$assets_dir/$installer" -x "$RUNNER_TEMP/updater.minisig" -p updater.pub
 
           asset_paths=()
           for name in "${expected_assets[@]}"; do asset_paths+=("$assets_dir/$name"); done
